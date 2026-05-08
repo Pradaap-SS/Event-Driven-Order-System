@@ -1,0 +1,37 @@
+{
+  "name": "event-driven-order-system",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "seed": "npx tsx scripts/seed.ts",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "next": "14.2.5",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "recharts": "^2.12.7",
+    "date-fns": "^3.6.0",
+    "uuid": "^10.0.0",
+    "clsx": "^2.1.1",
+    "tailwind-merge": "^2.4.0",
+    "lucide-react": "^0.414.0"
+  },
+  "devDependencies": {
+    "typescript": "^5",
+    "@types/node": "^20",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
+    "@types/uuid": "^10",
+    "tailwindcss": "^3.4.6",
+    "autoprefixer": "^10.4.19",
+    "postcss": "^8.4.40",
+    "tsx": "^4.16.2",
+    "eslint": "^8",
+    "eslint-config-next": "14.2.5"
+  }
+}
