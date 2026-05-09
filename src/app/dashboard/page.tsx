@@ -44,10 +44,15 @@ const STATUS_COLORS: Partial<Record<OrderStatus, string>> = {
   PAYMENT_PROCESSED:    "#a78bfa",
 };
 
+const ORDER_COUNT_OPTIONS = [5, 10, 25, 50] as const;
+type OrderCount = typeof ORDER_COUNT_OPTIONS[number];
+
 export default function DashboardPage() {
   const [metrics, setMetrics] = useState<DashboardMetrics | null>(null);
-  const [demoLoading, setDemoLoading] = useState(false);
-  const [demoMessage, setDemoMessage] = useState<string | null>(null);
+  const [demoLoading, setDemoLoading]   = useState(false);
+  const [demoMessage, setDemoMessage]   = useState<string | null>(null);
+  const [showPicker, setShowPicker]     = useState(false);
+  const [demoCount, setDemoCount]       = useState<OrderCount>(5);
 
   const timerRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
@@ -71,19 +76,35 @@ export default function DashboardPage() {
 
   useEffect(() => {
     mountedRef.current = true;
-    schedulePoll(0); // fire immediately on mount
+    schedulePoll(0);
     return () => {
       mountedRef.current = false;
       if (timerRef.current) clearTimeout(timerRef.current);
     };
   }, [schedulePoll]);
 
-  const runDemo = async () => {
+  // Close picker on outside click
+  useEffect(() => {
+    if (!showPicker) return;
+    const handler = (e: MouseEvent) => {
+      const target = e.target as Element;
+      if (!target.closest("[data-demo-picker]")) setShowPicker(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [showPicker]);
+
+  const runDemo = async (count: OrderCount) => {
+    setShowPicker(false);
     setDemoLoading(true);
     setDemoMessage(null);
     try {
-      const res = await fetch("/api/demo", { method: "POST" });
-      const data = await res.json();
+      const res = await fetch("/api/demo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ count }),
+      });
+      const data = await res.json() as { message: string };
       setDemoMessage(data.message);
       schedulePoll(0);
     } catch {
@@ -123,14 +144,79 @@ export default function DashboardPage() {
           {demoMessage && (
             <span className="text-xs text-green-400 font-mono">{demoMessage}</span>
           )}
-          <Button variant="ghost" size="sm" onClick={clearData}>
+          <Button variant="ghost" size="sm" onClick={clearData} disabled={demoLoading}>
             <Trash2 className="h-3.5 w-3.5" />
             Clear
           </Button>
-          <Button variant="primary" size="md" loading={demoLoading} onClick={runDemo}>
-            <Play className="h-4 w-4" />
-            Run Interview Demo
-          </Button>
+
+          {/* Demo button with inline count picker */}
+          <div className="relative" data-demo-picker>
+            <Button
+              variant="primary"
+              size="md"
+              loading={demoLoading}
+              onClick={() => setShowPicker((v) => !v)}
+            >
+              <Play className="h-4 w-4" />
+              Run Interview Demo
+              <svg className="h-3.5 w-3.5 ml-0.5" viewBox="0 0 12 12" fill="currentColor">
+                <path d="M6 8L1 3h10L6 8z" />
+              </svg>
+            </Button>
+
+            {showPicker && !demoLoading && (
+              <div className="absolute right-0 top-full mt-2 z-20 w-64 rounded-xl border border-zinc-800 bg-zinc-950 p-4 shadow-2xl">
+                <p className="text-xs font-medium text-zinc-500 uppercase tracking-wider mb-3">
+                  Orders to generate
+                </p>
+
+                {/* Count grid */}
+                <div className="grid grid-cols-4 gap-1.5 mb-4">
+                  {ORDER_COUNT_OPTIONS.map((n) => (
+                    <button
+                      key={n}
+                      onClick={() => setDemoCount(n)}
+                      className={`rounded-lg py-2 text-sm font-mono font-semibold transition-all ${
+                        demoCount === n
+                          ? "bg-indigo-600 text-white ring-1 ring-indigo-400/50"
+                          : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200"
+                      }`}
+                    >
+                      {n}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Breakdown — all orders are canonical, cycling across 5 types */}
+                <div className="rounded-lg bg-zinc-900 px-3 py-2 mb-3 text-xs font-mono space-y-1">
+                  {(["happy", "payment-fail", "inv-fail", "idempotency", "delayed"] as const).map(
+                    (label, idx) => {
+                      const n = Math.floor(demoCount / 5) + (idx < demoCount % 5 ? 1 : 0);
+                      return (
+                        <div key={label} className="flex justify-between">
+                          <span className="text-zinc-600">{label}</span>
+                          <span className={n > 0 ? "text-zinc-400" : "text-zinc-700"}>×{n}</span>
+                        </div>
+                      );
+                    }
+                  )}
+                  <div className="flex justify-between text-zinc-700 pt-1 border-t border-zinc-800">
+                    <span>pool: 50 customers · 25 products</span>
+                  </div>
+                </div>
+
+                <Button
+                  variant="primary"
+                  size="sm"
+                  className="w-full"
+                  onClick={() => runDemo(demoCount)}
+                >
+                  <Play className="h-3.5 w-3.5" />
+                  Generate {demoCount} orders
+                </Button>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
