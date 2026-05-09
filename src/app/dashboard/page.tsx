@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useRef } from "react";
 import {
   AreaChart,
   Area,
@@ -24,6 +24,7 @@ import {
   RotateCcw,
   Play,
   Trash2,
+  Zap,
 } from "lucide-react";
 import { Card, CardHeader, CardTitle } from "@/components/ui/card";
 import { StatusBadge } from "@/components/ui/badge";
@@ -47,52 +48,53 @@ const STATUS_COLORS: Partial<Record<OrderStatus, string>> = {
 const ORDER_COUNT_OPTIONS = [5, 10, 25, 50] as const;
 type OrderCount = typeof ORDER_COUNT_OPTIONS[number];
 
+const FLOOD_OPTIONS = [50, 100, 200, 500] as const;
+type FloodCount = typeof FLOOD_OPTIONS[number];
+
 export default function DashboardPage() {
   const [metrics, setMetrics] = useState<DashboardMetrics | null>(null);
   const [demoLoading, setDemoLoading]   = useState(false);
   const [demoMessage, setDemoMessage]   = useState<string | null>(null);
   const [showPicker, setShowPicker]     = useState(false);
   const [demoCount, setDemoCount]       = useState<OrderCount>(5);
+  const [floodLoading, setFloodLoading] = useState(false);
+  const [floodCount, setFloodCount]     = useState<FloodCount>(100);
+  const [showFloodPicker, setShowFloodPicker] = useState(false);
 
-  const timerRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const mountedRef = useRef(true);
+  // ── SSE subscription (replaces polling) ───────────────────────────────────
+  // EventSource auto-reconnects when the stream drops (server timeout, deploy).
+  // This is the correct architecture: push not pull.
+  useEffect(() => {
+    let es: EventSource;
 
-  const schedulePoll = useCallback((delayMs: number) => {
-    if (timerRef.current) clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(async () => {
-      if (!mountedRef.current) return;
-      try {
-        const res  = await fetch("/api/metrics");
-        const data = await res.json() as DashboardMetrics;
-        if (!mountedRef.current) return;
-        setMetrics(data);
-        // Fast while events are in-flight, back off when the system is idle.
-        schedulePoll(data.pendingEvents > 0 ? 1000 : 8000);
-      } catch {
-        schedulePoll(5000);
-      }
-    }, delayMs);
+    const connect = () => {
+      es = new EventSource("/api/stream");
+      es.onmessage = (e: MessageEvent<string>) => {
+        try {
+          setMetrics(JSON.parse(e.data) as DashboardMetrics);
+        } catch { /* malformed frame — skip */ }
+      };
+      es.onerror = () => {
+        es.close();
+        setTimeout(connect, 3000); // reconnect after 3s on error
+      };
+    };
+
+    connect();
+    return () => es?.close();
   }, []);
 
+  // ── Close pickers on outside click ────────────────────────────────────────
   useEffect(() => {
-    mountedRef.current = true;
-    schedulePoll(0);
-    return () => {
-      mountedRef.current = false;
-      if (timerRef.current) clearTimeout(timerRef.current);
-    };
-  }, [schedulePoll]);
-
-  // Close picker on outside click
-  useEffect(() => {
-    if (!showPicker) return;
+    if (!showPicker && !showFloodPicker) return;
     const handler = (e: MouseEvent) => {
-      const target = e.target as Element;
-      if (!target.closest("[data-demo-picker]")) setShowPicker(false);
+      const t = e.target as Element;
+      if (!t.closest("[data-demo-picker]"))  setShowPicker(false);
+      if (!t.closest("[data-flood-picker]")) setShowFloodPicker(false);
     };
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
-  }, [showPicker]);
+  }, [showPicker, showFloodPicker]);
 
   const runDemo = async (count: OrderCount) => {
     setShowPicker(false);
@@ -106,7 +108,7 @@ export default function DashboardPage() {
       });
       const data = await res.json() as { message: string };
       setDemoMessage(data.message);
-      schedulePoll(0);
+      // SSE stream picks up new state automatically — no manual refresh needed
     } catch {
       setDemoMessage("Demo failed — check console");
     } finally {
@@ -116,8 +118,26 @@ export default function DashboardPage() {
 
   const clearData = async () => {
     await fetch("/api/demo", { method: "DELETE" });
-    schedulePoll(0);
     setDemoMessage(null);
+  };
+
+  const runFlood = async (count: FloodCount) => {
+    setShowFloodPicker(false);
+    setFloodLoading(true);
+    setDemoMessage(null);
+    try {
+      const res  = await fetch("/api/load-test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ count }),
+      });
+      const data = await res.json() as { count: number; createdMs: number; ordersPerSec: number };
+      setDemoMessage(`Flood: ${data.count} orders created in ${data.createdMs}ms (${data.ordersPerSec}/s)`);
+    } catch {
+      setDemoMessage("Flood failed");
+    } finally {
+      setFloodLoading(false);
+    }
   };
 
   const pieData = metrics
@@ -144,10 +164,42 @@ export default function DashboardPage() {
           {demoMessage && (
             <span className="text-xs text-green-400 font-mono">{demoMessage}</span>
           )}
-          <Button variant="ghost" size="sm" onClick={clearData} disabled={demoLoading}>
+          <Button variant="ghost" size="sm" onClick={clearData} disabled={demoLoading || floodLoading}>
             <Trash2 className="h-3.5 w-3.5" />
             Clear
           </Button>
+
+          {/* Flood / Load Test button */}
+          <div className="relative" data-flood-picker>
+            <Button
+              variant="outline"
+              size="md"
+              loading={floodLoading}
+              onClick={() => { setShowFloodPicker((v) => !v); setShowPicker(false); }}
+            >
+              <Zap className="h-4 w-4 text-yellow-400" />
+              Flood
+              <svg className="h-3.5 w-3.5 ml-0.5" viewBox="0 0 12 12" fill="currentColor"><path d="M6 8L1 3h10L6 8z" /></svg>
+            </Button>
+            {showFloodPicker && !floodLoading && (
+              <div className="absolute right-0 top-full mt-2 z-20 w-56 rounded-xl border border-zinc-800 bg-zinc-950 p-4 shadow-2xl">
+                <p className="text-xs font-medium text-zinc-500 uppercase tracking-wider mb-3">Orders to create</p>
+                <div className="grid grid-cols-4 gap-1.5 mb-3">
+                  {FLOOD_OPTIONS.map((n) => (
+                    <button key={n} onClick={() => setFloodCount(n)}
+                      className={`rounded-lg py-2 text-sm font-mono font-semibold transition-all ${floodCount === n ? "bg-yellow-600 text-white" : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700"}`}>
+                      {n}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[10px] text-zinc-600 font-mono mb-3">No draining — queue fills up, SSE shows throughput spike</p>
+                <Button variant="primary" size="sm" className="w-full !bg-yellow-700 hover:!bg-yellow-600" onClick={() => runFlood(floodCount)}>
+                  <Zap className="h-3.5 w-3.5" />
+                  Flood {floodCount} orders
+                </Button>
+              </div>
+            )}
+          </div>
 
           {/* Demo button with inline count picker */}
           <div className="relative" data-demo-picker>
@@ -158,7 +210,7 @@ export default function DashboardPage() {
               onClick={() => setShowPicker((v) => !v)}
             >
               <Play className="h-4 w-4" />
-              Run Interview Demo
+              Run Demo
               <svg className="h-3.5 w-3.5 ml-0.5" viewBox="0 0 12 12" fill="currentColor">
                 <path d="M6 8L1 3h10L6 8z" />
               </svg>
@@ -284,6 +336,35 @@ export default function DashboardPage() {
         />
       </div>
 
+      {/* Latency Percentiles */}
+      {metrics?.latencyPercentiles && (
+        <Card>
+          <div className="flex items-center justify-between mb-3">
+            <CardTitle>Processing Latency Percentiles</CardTitle>
+            <span className="text-xs text-zinc-600 font-mono">{metrics.latencyPercentiles.sampleCount} samples</span>
+          </div>
+          <div className="grid grid-cols-3 gap-3 sm:grid-cols-6">
+            {([
+              { label: "min",  value: metrics.latencyPercentiles.min },
+              { label: "p50",  value: metrics.latencyPercentiles.p50 },
+              { label: "p75",  value: metrics.latencyPercentiles.p75 },
+              { label: "p95",  value: metrics.latencyPercentiles.p95 },
+              { label: "p99",  value: metrics.latencyPercentiles.p99 },
+              { label: "max",  value: metrics.latencyPercentiles.max },
+            ] as const).map(({ label, value }) => (
+              <div key={label} className="text-center rounded-lg bg-zinc-900/60 py-3 px-2">
+                <p className={`text-lg font-bold font-mono ${
+                  label === "p99" || label === "max" ? "text-orange-400"
+                  : label === "p95"                 ? "text-yellow-400"
+                  : "text-zinc-200"
+                }`}>{value}<span className="text-xs text-zinc-600 ml-0.5">ms</span></p>
+                <p className="text-xs text-zinc-500 mt-0.5 uppercase tracking-wider">{label}</p>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
       {/* Charts Row */}
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         {/* Throughput */}
@@ -401,26 +482,9 @@ export default function DashboardPage() {
           <div className="h-40">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={metrics.latencyByType}>
-                <XAxis
-                  dataKey="type"
-                  tick={{ fill: "#71717a", fontSize: 9 }}
-                  axisLine={false}
-                  tickLine={false}
-                />
-                <YAxis
-                  tick={{ fill: "#71717a", fontSize: 10 }}
-                  axisLine={false}
-                  tickLine={false}
-                />
-                <Tooltip
-                  contentStyle={{
-                    background: "#18181b",
-                    border: "1px solid #27272a",
-                    borderRadius: 8,
-                    color: "#fafafa",
-                    fontSize: 12,
-                  }}
-                />
+                <XAxis dataKey="type" tick={{ fill: "#71717a", fontSize: 9 }} axisLine={false} tickLine={false} />
+                <YAxis tick={{ fill: "#71717a", fontSize: 10 }} axisLine={false} tickLine={false} />
+                <Tooltip contentStyle={{ background: "#18181b", border: "1px solid #27272a", borderRadius: 8, color: "#fafafa", fontSize: 12 }} />
                 <Bar dataKey="avgMs" fill="#6366f1" radius={[3, 3, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
@@ -428,43 +492,143 @@ export default function DashboardPage() {
         </Card>
       )}
 
-      {/* Recent Event Traces */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Recent Event Traces</CardTitle>
-        </CardHeader>
+      {/* Consumer Health */}
+      {metrics && metrics.consumerHealth.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Consumer Health</CardTitle>
+          </CardHeader>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
+            {metrics.consumerHealth.map((c) => {
+              const rate = c.totalProcessed > 0 ? c.successCount / c.totalProcessed : 1;
+              const status = c.totalProcessed === 0 ? "idle"
+                : rate >= 0.95 ? "healthy"
+                : rate >= 0.8  ? "degraded"
+                : "failed";
+              const statusColor = status === "healthy" ? "text-green-400"
+                : status === "degraded" ? "text-yellow-400"
+                : status === "idle"     ? "text-zinc-600"
+                : "text-red-400";
+              const dotColor = status === "healthy" ? "bg-green-400"
+                : status === "degraded" ? "bg-yellow-400"
+                : status === "idle"     ? "bg-zinc-600"
+                : "bg-red-400";
+              return (
+                <div key={c.consumer} className="rounded-lg border border-zinc-800/60 bg-zinc-900/40 p-3">
+                  <div className="flex items-center gap-1.5 mb-2">
+                    <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${dotColor} ${status === "healthy" ? "animate-pulse" : ""}`} />
+                    <span className="text-xs font-mono text-zinc-300 truncate">{c.consumer}</span>
+                  </div>
+                  <div className="space-y-0.5 text-xs">
+                    <div className="flex justify-between">
+                      <span className="text-zinc-600">processed</span>
+                      <span className="font-mono text-zinc-300">{c.totalProcessed}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-zinc-600">success</span>
+                      <span className={`font-mono ${statusColor}`}>
+                        {c.totalProcessed > 0 ? `${(rate * 100).toFixed(0)}%` : "—"}
+                      </span>
+                    </div>
+                    {c.avgLatencyMs > 0 && (
+                      <div className="flex justify-between">
+                        <span className="text-zinc-600">avg latency</span>
+                        <span className="font-mono text-zinc-400">{c.avgLatencyMs}ms</span>
+                      </div>
+                    )}
+                    {c.lastError && (
+                      <p className="text-red-400 font-mono truncate mt-1" title={c.lastError}>
+                        {c.lastError.slice(0, 28)}…
+                      </p>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
+
+      {/* Live Activity Feed */}
+      <Card className="p-0 overflow-hidden">
+        <div className="flex items-center justify-between px-5 py-3.5 border-b border-zinc-800/60">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium text-zinc-300">Live Activity Feed</span>
+            {metrics && metrics.pendingEvents > 0 && (
+              <span className="flex items-center gap-1 text-xs text-yellow-400 font-mono">
+                <span className="h-1.5 w-1.5 rounded-full bg-yellow-400 animate-pulse" />
+                {metrics.pendingEvents} pending
+              </span>
+            )}
+          </div>
+          {metrics && metrics.recentEvents.length > 0 && (
+            <span className="flex items-center gap-1.5 text-xs text-green-400">
+              <span className="h-1.5 w-1.5 rounded-full bg-green-400 animate-pulse" />
+              live
+            </span>
+          )}
+        </div>
+
         {!metrics || metrics.recentEvents.length === 0 ? (
           <div className="text-center py-12 text-zinc-600">
             <Activity className="h-8 w-8 mx-auto mb-2 opacity-30" />
             <p className="text-sm">No events yet — run the demo to populate</p>
           </div>
         ) : (
-          <div className="space-y-1">
-            {metrics.recentEvents.slice(0, 12).map((event) => {
+          <div className="divide-y divide-zinc-800/30 max-h-80 overflow-y-auto">
+            {metrics.recentEvents.map((event, idx) => {
               const cfg = EVENT_CONFIG[event.type];
+              const isNew = idx === 0;
               return (
                 <div
                   key={event.id}
-                  className="flex items-center gap-3 rounded-lg px-3 py-2 hover:bg-zinc-800/40 transition-colors"
+                  className={`flex items-center gap-3 px-5 py-2.5 hover:bg-zinc-800/30 transition-colors ${isNew ? "animate-in" : ""}`}
                 >
-                  <div className={`h-1.5 w-1.5 rounded-full shrink-0 ${cfg?.color.replace("text-", "bg-")}`} />
-                  <span className={`text-xs font-mono font-medium w-48 shrink-0 ${cfg?.color}`}>
+                  {/* Status dot */}
+                  <div className={`h-1.5 w-1.5 rounded-full shrink-0 ${
+                    event.status === "DEAD_LETTERED" ? "bg-red-500"
+                    : event.status === "FAILED"      ? "bg-orange-500"
+                    : cfg?.color.replace("text-", "bg-") ?? "bg-zinc-500"
+                  }`} />
+
+                  {/* Event type */}
+                  <span className={`text-xs font-mono font-medium w-52 shrink-0 ${cfg?.color ?? "text-zinc-400"}`}>
                     {event.type}
                   </span>
-                  <span className="text-xs text-zinc-600 font-mono w-32 shrink-0">
+
+                  {/* Order ID */}
+                  <span className="text-xs text-zinc-600 font-mono w-24 shrink-0">
                     {event.aggregateId.slice(0, 8)}…
                   </span>
-                  <span className="text-xs text-zinc-500">
+
+                  {/* Producer → Consumer */}
+                  <span className="text-xs text-zinc-600 hidden lg:block">
                     {cfg?.producer}
+                    {event.consumer && event.consumer !== cfg?.producer && (
+                      <span className="text-zinc-700"> → {event.consumer.split(",")[0]}</span>
+                    )}
                   </span>
-                  <span className="ml-auto text-xs text-zinc-600">
-                    {formatRelative(event.timestamp)}
-                  </span>
-                  {event.retryCount > 0 && (
-                    <span className="text-xs text-orange-400 font-mono">
-                      retry×{event.retryCount}
+
+                  {/* Latency */}
+                  {event.processingLatencyMs !== null && (
+                    <span className="text-xs text-zinc-700 font-mono hidden xl:block">
+                      {event.processingLatencyMs}ms
                     </span>
                   )}
+
+                  {/* Retry badge */}
+                  {event.retryCount > 0 && (
+                    <span className="text-xs text-orange-400 font-mono shrink-0">×{event.retryCount}</span>
+                  )}
+
+                  {/* DLQ badge */}
+                  {event.status === "DEAD_LETTERED" && (
+                    <span className="text-[10px] bg-red-950/60 text-red-400 rounded px-1.5 py-0.5 shrink-0">DLQ</span>
+                  )}
+
+                  <span className="ml-auto text-xs text-zinc-600 shrink-0">
+                    {formatRelative(event.timestamp)}
+                  </span>
                 </div>
               );
             })}

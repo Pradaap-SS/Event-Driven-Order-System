@@ -2,17 +2,14 @@ import { NextResponse } from "next/server";
 import { store } from "@/lib/store";
 import { processNextBatch } from "@/lib/event-bus";
 import "@/domain/handlers";
-import type { DashboardMetrics, OrderStatus } from "@/lib/types";
+import type { DashboardMetrics, OrderStatus, ConsumerHealth, ConsumerLagStat } from "@/lib/types";
 
 export async function GET() {
-  // Process any pending events before building the response.
-  // The dashboard polls this endpoint every 1.5s — that's sufficient to drive
-  // the async pipeline without a dedicated polling route.
   await processNextBatch(10);
 
-  const stats = store.getStats();
-  const allOrders = store.getAllOrders();
-  const allEvents = store.getAllEvents();
+  const stats      = store.getStats();
+  const allOrders  = store.getAllOrders();
+  const allEvents  = store.getAllEvents();
   const throughput = store.getThroughput();
 
   // Orders by status
@@ -35,7 +32,7 @@ export async function GET() {
     avgMs: Math.round(vals.reduce((s, v) => s + v, 0) / vals.length),
   }));
 
-  // Throughput: ensure at least the last 10 minutes appear in the chart
+  // Filled throughput chart (last 10 minutes)
   const now = new Date();
   const filledThroughput = [];
   for (let i = 9; i >= 0; i--) {
@@ -46,18 +43,70 @@ export async function GET() {
   }
 
   const recentEvents = allEvents
-    .filter((e) => e.status === "PROCESSED" || e.status === "FAILED")
-    .slice(-20)
+    .filter((e) => e.status === "PROCESSED" || e.status === "FAILED" || e.status === "DEAD_LETTERED")
+    .slice(-25)
     .reverse();
+
+  // Consumer health — aggregate execution logs per consumer
+  const execLogs = store.getAllExecutionLogs();
+  const consumerMap = new Map<string, {
+    total: number; success: number; failures: number;
+    latencies: number[]; lastError: string | null;
+  }>();
+
+  for (const log of execLogs) {
+    if (!consumerMap.has(log.consumer)) {
+      consumerMap.set(log.consumer, { total: 0, success: 0, failures: 0, latencies: [], lastError: null });
+    }
+    const s = consumerMap.get(log.consumer)!;
+    s.total++;
+    if (log.status === "SUCCESS") {
+      s.success++;
+      if (log.latencyMs !== null) s.latencies.push(log.latencyMs);
+    } else if (log.status === "FAILED") {
+      s.failures++;
+      if (log.error) s.lastError = log.error;
+    }
+  }
+
+  const CONSUMER_ORDER = [
+    "validation-service", "inventory-service", "payment-service",
+    "order-service", "notification-service", "compensation-service",
+    "retry-scheduler", "dlq-processor",
+  ];
+
+  const consumerHealth: ConsumerHealth[] = Array.from(consumerMap.entries())
+    .sort(([a], [b]) => {
+      const ai = CONSUMER_ORDER.indexOf(a);
+      const bi = CONSUMER_ORDER.indexOf(b);
+      return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+    })
+    .map(([consumer, s]) => ({
+      consumer,
+      totalProcessed: s.total,
+      successCount:   s.success,
+      failureCount:   s.failures,
+      avgLatencyMs:   s.latencies.length > 0
+        ? Math.round(s.latencies.reduce((a, b) => a + b, 0) / s.latencies.length)
+        : 0,
+      lastError: s.lastError,
+    }));
+
+  const consumerLag: ConsumerLagStat[] = store.getLagStats()
+    .sort((a, b) => b.avgLagMs - a.avgLagMs);
+
+  const latencyPercentiles = store.getLatencyPercentiles();
 
   const metrics: DashboardMetrics = {
     ...stats,
-    throughputPerMinute:
-      filledThroughput[filledThroughput.length - 1]?.count ?? 0,
+    throughputPerMinute: filledThroughput[filledThroughput.length - 1]?.count ?? 0,
     ordersByStatus,
     recentEvents,
     eventThroughput: filledThroughput,
     latencyByType,
+    consumerHealth,
+    consumerLag,
+    latencyPercentiles,
   };
 
   return NextResponse.json(metrics);

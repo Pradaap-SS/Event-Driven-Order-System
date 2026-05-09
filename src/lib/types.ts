@@ -156,6 +156,32 @@ export interface CreateOrderInput {
   idempotencyKey?: string;
 }
 
+export interface ConsumerHealth {
+  consumer: string;
+  totalProcessed: number;
+  successCount: number;
+  failureCount: number;
+  avgLatencyMs: number;
+  lastError: string | null;
+}
+
+export interface LatencyPercentiles {
+  p50: number;
+  p75: number;
+  p95: number;
+  p99: number;
+  min: number;
+  max: number;
+  sampleCount: number;
+}
+
+export interface ConsumerLagStat {
+  eventType: string;
+  avgLagMs: number;
+  maxLagMs: number;
+  sampleCount: number;
+}
+
 export interface EventThroughputPoint {
   minute: string;
   count: number;
@@ -174,4 +200,7 @@ export interface DashboardMetrics {
   recentEvents: DomainEvent[];
   eventThroughput: EventThroughputPoint[];
   latencyByType: Array<{ type: string; avgMs: number }>;
+  consumerHealth: ConsumerHealth[];
+  consumerLag: ConsumerLagStat[];
+  latencyPercentiles: LatencyPercentiles | null;
 }

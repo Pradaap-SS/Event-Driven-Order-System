@@ -2,10 +2,12 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
-import { ChevronLeft, ArrowRight, RotateCcw } from "lucide-react";
+import { ChevronLeft, ArrowRight, RotateCcw, RefreshCcw, Download } from "lucide-react";
 import { StatusBadge, Badge } from "@/components/ui/badge";
 import { Card, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { SagaDiagram } from "@/components/order-detail/saga-diagram";
+import { TraceWaterfall } from "@/components/order-detail/trace-waterfall";
 import {
   formatCurrency,
   formatDate,
@@ -34,8 +36,14 @@ export default function OrderDetailPage({
 }: {
   params: { id: string };
 }) {
-  const [data, setData] = useState<OrderDetailData | null>(null);
+  const [data, setData]         = useState<OrderDetailData | null>(null);
   const [retrying, setRetrying] = useState<string | null>(null);
+  const [replaying, setReplaying] = useState(false);
+  const [replayMsg, setReplayMsg] = useState<string | null>(null);
+  // Event timeline filters
+  const [typeFilter, setTypeFilter]     = useState<string>("ALL");
+  const [statusFilter, setStatusFilter] = useState<string>("ALL");
+  const [producerFilter, setProducerFilter] = useState("");
   const timerRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
 
@@ -67,6 +75,23 @@ export default function OrderDetailPage({
       if (timerRef.current) clearTimeout(timerRef.current);
     };
   }, [poll]);
+
+  const replayFromLog = async () => {
+    setReplaying(true);
+    setReplayMsg(null);
+    try {
+      const res = await fetch(`/api/orders/${params.id}/replay`, { method: "POST" });
+      const d = await res.json() as { message: string };
+      setReplayMsg(d.message);
+      poll(0);
+    } finally {
+      setReplaying(false);
+    }
+  };
+
+  const exportNDJSON = () => {
+    window.open(`/api/orders/${params.id}/export`, "_blank");
+  };
 
   const retryDLQ = async (dlqId: string) => {
     setRetrying(dlqId);
@@ -101,15 +126,29 @@ export default function OrderDetailPage({
       </div>
 
       {/* Header */}
-      <div className="flex items-start justify-between">
+      <div className="flex items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-zinc-100">{order.customerName}</h1>
           <p className="text-sm text-zinc-500 mt-1">{order.customerEmail}</p>
+          {replayMsg && (
+            <p className="text-xs text-green-400 font-mono mt-1">{replayMsg}</p>
+          )}
         </div>
-        <StatusBadge status={order.status} pulse={
-          order.status === "CREATED" || order.status === "VALIDATED" ||
-          order.status === "INVENTORY_RESERVED" || order.status === "PAYMENT_PROCESSED"
-        } />
+        <div className="flex items-center gap-2 shrink-0">
+          <Button variant="ghost" size="sm" onClick={exportNDJSON} title="Export as NDJSON">
+            <Download className="h-3.5 w-3.5" />
+            Export
+          </Button>
+          <Button variant="outline" size="sm" loading={replaying} onClick={replayFromLog}
+            title="Rebuild projection from event log (event sourcing replay)">
+            <RefreshCcw className="h-3.5 w-3.5" />
+            Replay
+          </Button>
+          <StatusBadge status={order.status} pulse={
+            order.status === "CREATED" || order.status === "VALIDATED" ||
+            order.status === "INVENTORY_RESERVED" || order.status === "PAYMENT_PROCESSED"
+          } />
+        </div>
       </div>
 
       {/* Quick Stats */}
@@ -120,25 +159,102 @@ export default function OrderDetailPage({
         <StatCard label="Created" value={formatRelative(order.createdAt)} />
       </div>
 
+      {/* Saga State Machine */}
+      <Card>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-sm font-medium text-zinc-300">Saga State Machine</h2>
+          <span className="text-xs text-zinc-600 font-mono">
+            {events.length} event{events.length !== 1 ? "s" : ""} · current:{" "}
+            <span className="text-zinc-400">{order.status}</span>
+          </span>
+        </div>
+        <SagaDiagram order={order} events={events} />
+      </Card>
+
+      {/* Distributed Trace Waterfall */}
+      <Card>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-sm font-medium text-zinc-300">Distributed Trace</h2>
+          <span className="text-xs text-zinc-600 font-mono">
+            OTel-compatible · traceId = correlationId
+          </span>
+        </div>
+        <TraceWaterfall orderId={order.id} />
+      </Card>
+
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         {/* Event Timeline — main column */}
         <div className="lg:col-span-2 space-y-6">
           <Card className="p-0 overflow-hidden">
-            <div className="px-5 py-4 border-b border-zinc-800/60">
-              <h2 className="text-sm font-medium text-zinc-300">
-                Event Timeline
-                <Badge variant="muted" className="ml-2">{events.length}</Badge>
-              </h2>
+            {/* Timeline header + filters */}
+            <div className="px-5 py-3.5 border-b border-zinc-800/60 space-y-3">
+              <div className="flex items-center justify-between">
+                <h2 className="text-sm font-medium text-zinc-300">
+                  Event Timeline
+                  <Badge variant="muted" className="ml-2">{events.length}</Badge>
+                </h2>
+                {(typeFilter !== "ALL" || statusFilter !== "ALL" || producerFilter) && (
+                  <button
+                    onClick={() => { setTypeFilter("ALL"); setStatusFilter("ALL"); setProducerFilter(""); }}
+                    className="text-xs text-indigo-400 hover:text-indigo-300"
+                  >
+                    Clear filters
+                  </button>
+                )}
+              </div>
+              {/* Filter controls */}
+              <div className="flex flex-wrap gap-2">
+                <select
+                  value={typeFilter}
+                  onChange={(e) => setTypeFilter(e.target.value)}
+                  className="rounded border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-300 focus:border-indigo-500 focus:outline-none"
+                >
+                  <option value="ALL">All types</option>
+                  {Array.from(new Set(events.map((e) => e.type))).map((t) => (
+                    <option key={t} value={t}>{t}</option>
+                  ))}
+                </select>
+                <select
+                  value={statusFilter}
+                  onChange={(e) => setStatusFilter(e.target.value)}
+                  className="rounded border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-300 focus:border-indigo-500 focus:outline-none"
+                >
+                  <option value="ALL">All statuses</option>
+                  {["PENDING","PROCESSING","PROCESSED","FAILED","DEAD_LETTERED"].map((s) => (
+                    <option key={s} value={s}>{s}</option>
+                  ))}
+                </select>
+                <input
+                  type="text"
+                  placeholder="Filter producer…"
+                  value={producerFilter}
+                  onChange={(e) => setProducerFilter(e.target.value)}
+                  className="rounded border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-300 placeholder-zinc-600 focus:border-indigo-500 focus:outline-none"
+                />
+              </div>
             </div>
             <div className="divide-y divide-zinc-800/30">
               {events.length === 0 ? (
                 <div className="py-10 text-center text-zinc-600 text-sm">
                   No events yet — processing…
                 </div>
-              ) : (
-                events.map((event, idx) => {
+              ) : (() => {
+                const filtered = events.filter((e) => {
+                  if (typeFilter !== "ALL" && e.type !== typeFilter) return false;
+                  if (statusFilter !== "ALL" && e.status !== statusFilter) return false;
+                  if (producerFilter && !e.producer.toLowerCase().includes(producerFilter.toLowerCase())) return false;
+                  return true;
+                });
+                if (filtered.length === 0) {
+                  return (
+                    <div className="py-8 text-center text-zinc-600 text-sm">
+                      No events match the current filters
+                    </div>
+                  );
+                }
+                return filtered.map((event, idx) => {
                   const cfg = EVENT_CONFIG[event.type];
-                  const isLast = idx === events.length - 1;
+                  const isLast = idx === filtered.length - 1;
                   return (
                     <div key={event.id} className="flex gap-4 px-5 py-4 hover:bg-zinc-800/20 transition-colors">
                       {/* Timeline connector */}
@@ -203,8 +319,8 @@ export default function OrderDetailPage({
                       </div>
                     </div>
                   );
-                })
-              )}
+                });
+              })()}
             </div>
           </Card>
 

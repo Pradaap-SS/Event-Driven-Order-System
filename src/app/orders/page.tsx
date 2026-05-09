@@ -145,6 +145,11 @@ export default function OrdersPage() {
                   <td className="px-5 py-3.5">
                     <p className="text-sm font-medium text-zinc-200">{order.customerName}</p>
                     <p className="text-xs text-zinc-500">{order.customerEmail}</p>
+                    {order.notes && (
+                      <p className="text-[10px] text-zinc-600 font-mono mt-0.5 truncate max-w-[200px]">
+                        {order.notes}
+                      </p>
+                    )}
                   </td>
                   <td className="px-5 py-3.5">
                     <StatusBadge

@@ -10,6 +10,7 @@
 
 import { subscribe, publish } from "@/lib/event-bus";
 import { store } from "@/lib/store";
+import { getBreaker } from "@/lib/circuit-breaker";
 import type { DomainEvent, OrderStatus } from "@/lib/types";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -104,12 +105,14 @@ subscribe("OrderValidated", "inventory-service", async (event: DomainEvent) => {
   const order = store.getOrder(event.aggregateId);
   if (!order) throw new Error("Order not found");
 
-  const chaos = store.getChaos();
-  const fail = Math.random() < chaos.inventoryFailureRate;
+  // Circuit breaker wraps the downstream inventory API call
+  await getBreaker("inventory-service").call(async () => {
+    const chaos = store.getChaos();
+    const fail = Math.random() < chaos.inventoryFailureRate;
 
-  updateProjectionLastEvent(event);
+    updateProjectionLastEvent(event);
 
-  if (fail) {
+    if (fail) {
     updateOrderStatus(order.id, "INVENTORY_FAILED");
     publish({
       type: "InventoryReservationFailed",
@@ -128,24 +131,25 @@ subscribe("OrderValidated", "inventory-service", async (event: DomainEvent) => {
       consumer: null,
       maxRetries: 0,
     });
-  } else {
-    updateOrderStatus(order.id, "INVENTORY_RESERVED");
-    publish({
-      type: "InventoryReserved",
-      correlationId: event.correlationId,
-      causationId: event.id,
-      aggregateId: order.id,
-      payload: {
-        reservationId: `RES-${Date.now()}`,
-        items: order.items.map((i) => ({ sku: i.sku, qty: i.quantity })),
-      },
-      timestamp: new Date(),
-      scheduledFor: scheduleAfter(700 + delay),
-      producer: "inventory-service",
-      consumer: null,
-      maxRetries: 3,
-    });
-  }
+    } else {
+      updateOrderStatus(order.id, "INVENTORY_RESERVED");
+      publish({
+        type: "InventoryReserved",
+        correlationId: event.correlationId,
+        causationId: event.id,
+        aggregateId: order.id,
+        payload: {
+          reservationId: `RES-${Date.now()}`,
+          items: order.items.map((i) => ({ sku: i.sku, qty: i.quantity })),
+        },
+        timestamp: new Date(),
+        scheduledFor: scheduleAfter(700 + delay),
+        producer: "inventory-service",
+        consumer: null,
+        maxRetries: 3,
+      });
+    }
+  }); // end circuit breaker
 });
 
 // ─── Payment Service ──────────────────────────────────────────────────────────
@@ -155,54 +159,52 @@ subscribe("InventoryReserved", "payment-service", async (event: DomainEvent) => 
   const order = store.getOrder(event.aggregateId);
   if (!order) throw new Error("Order not found");
 
-  const chaos = store.getChaos();
+  // Circuit breaker: payment gateway is the most fragile external dependency
+  await getBreaker("payment-service").call(async () => {
+    const chaos = store.getChaos();
 
-  if (chaos.consumerTimeoutRate > 0 && Math.random() < chaos.consumerTimeoutRate) {
-    throw new Error("Payment gateway timeout: upstream service unavailable");
-  }
+    if (chaos.consumerTimeoutRate > 0 && Math.random() < chaos.consumerTimeoutRate) {
+      throw new Error("Payment gateway timeout: upstream service unavailable");
+    }
 
-  const fail = Math.random() < chaos.paymentFailureRate;
+    const fail = Math.random() < chaos.paymentFailureRate;
+    updateProjectionLastEvent(event);
 
-  updateProjectionLastEvent(event);
-
-  if (fail) {
-    updateOrderStatus(order.id, "PAYMENT_FAILED");
-    publish({
-      type: "PaymentFailed",
-      correlationId: event.correlationId,
-      causationId: event.id,
-      aggregateId: order.id,
-      payload: {
-        reason: "Card declined",
-        amount: order.totalAmount,
-        currency: "USD",
-      },
-      timestamp: new Date(),
-      scheduledFor: scheduleAfter(delay),
-      producer: "payment-service",
-      consumer: null,
-      maxRetries: 0,
-    });
-  } else {
-    updateOrderStatus(order.id, "PAYMENT_PROCESSED");
-    publish({
-      type: "PaymentProcessed",
-      correlationId: event.correlationId,
-      causationId: event.id,
-      aggregateId: order.id,
-      payload: {
-        transactionId: `TXN-${Date.now()}`,
-        amount: order.totalAmount,
-        currency: "USD",
-        method: "card",
-      },
-      timestamp: new Date(),
-      scheduledFor: scheduleAfter(500 + delay),
-      producer: "payment-service",
-      consumer: null,
-      maxRetries: 3,
-    });
-  }
+    if (fail) {
+      updateOrderStatus(order.id, "PAYMENT_FAILED");
+      publish({
+        type: "PaymentFailed",
+        correlationId: event.correlationId,
+        causationId: event.id,
+        aggregateId: order.id,
+        payload: { reason: "Card declined", amount: order.totalAmount, currency: "USD" },
+        timestamp: new Date(),
+        scheduledFor: scheduleAfter(delay),
+        producer: "payment-service",
+        consumer: null,
+        maxRetries: 0,
+      });
+    } else {
+      updateOrderStatus(order.id, "PAYMENT_PROCESSED");
+      publish({
+        type: "PaymentProcessed",
+        correlationId: event.correlationId,
+        causationId: event.id,
+        aggregateId: order.id,
+        payload: {
+          transactionId: `TXN-${Date.now()}`,
+          amount: order.totalAmount,
+          currency: "USD",
+          method: "card",
+        },
+        timestamp: new Date(),
+        scheduledFor: scheduleAfter(500 + delay),
+        producer: "payment-service",
+        consumer: null,
+        maxRetries: 3,
+      });
+    }
+  }); // end circuit breaker
 });
 
 // ─── Order Confirmation ───────────────────────────────────────────────────────

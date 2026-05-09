@@ -6,6 +6,7 @@
  * For production, replace with a Postgres-backed store behind the same interface.
  */
 
+import { clearTraces } from "./tracer";
 import type {
   Order,
   DomainEvent,
@@ -29,6 +30,10 @@ interface StoreState {
   idempotencyKeys: Map<string, IdempotencyRecord>;
   throughputLog: EventThroughputPoint[];
   chaos: ChaosConfig;
+  // Consumer group lag: eventType → [lagMs samples]
+  lagSamples: Map<string, number[]>;
+  // All end-to-end processing latencies (capped at 2000 samples)
+  allLatencies: number[];
 }
 
 // ─── Singleton via global ─────────────────────────────────────────────────────
@@ -48,6 +53,8 @@ function createState(): StoreState {
     executionLogs: new Map(),
     idempotencyKeys: new Map(),
     throughputLog: [],
+    lagSamples: new Map(),
+    allLatencies: [],
     chaos: {
       paymentFailureRate: 0,
       inventoryFailureRate: 0,
@@ -187,6 +194,40 @@ export const store = {
     state.chaos = { ...state.chaos, ...config };
   },
 
+  // ── Latency percentiles ───────────────────────────────────────────────────
+  recordLatency(ms: number): void {
+    state.allLatencies.push(ms);
+    if (state.allLatencies.length > 2000) state.allLatencies.shift();
+  },
+  getLatencyPercentiles() {
+    const samples = state.allLatencies;
+    if (samples.length === 0) return null;
+    const sorted = [...samples].sort((a, b) => a - b);
+    const pct = (p: number) => sorted[Math.max(0, Math.ceil(p / 100 * sorted.length) - 1)];
+    return {
+      p50: pct(50), p75: pct(75), p95: pct(95), p99: pct(99),
+      min: sorted[0], max: sorted[sorted.length - 1],
+      sampleCount: sorted.length,
+    };
+  },
+
+  // ── Consumer lag ──────────────────────────────────────────────────────────
+  recordLag(eventType: string, lagMs: number): void {
+    const samples = state.lagSamples.get(eventType) ?? [];
+    samples.push(lagMs);
+    // Keep last 200 samples per type
+    if (samples.length > 200) samples.shift();
+    state.lagSamples.set(eventType, samples);
+  },
+  getLagStats() {
+    return Array.from(state.lagSamples.entries()).map(([eventType, samples]) => ({
+      eventType,
+      avgLagMs: Math.round(samples.reduce((a, b) => a + b, 0) / samples.length),
+      maxLagMs: Math.max(...samples),
+      sampleCount: samples.length,
+    }));
+  },
+
   // ── Metrics ───────────────────────────────────────────────────────────────
   getThroughput(): EventThroughputPoint[] {
     return [...state.throughputLog];
@@ -230,6 +271,9 @@ export const store = {
     state.executionLogs.clear();
     state.idempotencyKeys.clear();
     state.throughputLog.length = 0;
+    state.lagSamples.clear();
+    state.allLatencies.length = 0;
+    clearTraces();
     state.chaos = {
       paymentFailureRate: 0,
       inventoryFailureRate: 0,

@@ -14,7 +14,19 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" className="dark">
+    <html lang="en" className="dark" suppressHydrationWarning>
+      <head>
+        {/* Prevent flash of wrong theme — runs before React hydrates */}
+        <script dangerouslySetInnerHTML={{ __html: `
+          (function(){
+            var t = localStorage.getItem('orderflow-theme');
+            var sys = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+            var theme = t || sys;
+            if (theme === 'light') document.documentElement.classList.remove('dark');
+            else document.documentElement.classList.add('dark');
+          })();
+        `}} />
+      </head>
       <body className="bg-zinc-950 text-zinc-100 antialiased">
         <div className="flex min-h-screen">
           <Sidebar />

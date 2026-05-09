@@ -17,6 +17,7 @@ import { Button } from "@/components/ui/button";
 import { Badge, StatusBadge } from "@/components/ui/badge";
 import { formatRelative, formatCurrency, EVENT_CONFIG } from "@/lib/utils";
 import type { ChaosConfig, DeadLetterEvent, Order } from "@/lib/types";
+import type { CBStats } from "@/lib/circuit-breaker";
 
 const SAMPLE_ITEMS = [
   { sku: "SKU-A100", name: "Wireless Headset Pro",   unitPrice: 149.99 },
@@ -33,8 +34,9 @@ export default function FailureLabPage() {
     consumerTimeoutRate: 0,
     poisonMessageEnabled: false,
   });
-  const [dlq, setDlq] = useState<DeadLetterEvent[]>([]);
+  const [dlq, setDlq]               = useState<DeadLetterEvent[]>([]);
   const [recentOrders, setRecentOrders] = useState<Order[]>([]);
+  const [breakers, setBreakers]     = useState<CBStats[]>([]);
   const [retrying, setRetrying] = useState<string | null>(null);
   const [firing, setFiring] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -49,18 +51,21 @@ export default function FailureLabPage() {
     timerRef.current = setTimeout(async () => {
       if (!mountedRef.current) return;
       try {
-        const [chaosRes, dlqRes, ordersRes] = await Promise.all([
+        const [chaosRes, dlqRes, ordersRes, cbRes] = await Promise.all([
           fetch("/api/chaos"),
           fetch("/api/dlq"),
           fetch("/api/orders"),
+          fetch("/api/circuit-breakers"),
         ]);
         if (!chaosRes.ok || !dlqRes.ok || !ordersRes.ok) { poll(5000); return; }
         const dlqData    = await dlqRes.json() as { events: DeadLetterEvent[] };
         const ordersData = await ordersRes.json() as { orders: Order[] };
+        const cbData     = cbRes.ok ? await cbRes.json() as { breakers: CBStats[] } : { breakers: [] };
         if (!mountedRef.current) return;
         setChaos(await chaosRes.json());
         setDlq(dlqData.events);
         setRecentOrders(ordersData.orders.slice(0, 10));
+        setBreakers(cbData.breakers);
         // Fast while orders are in-flight or DLQ is growing, slow when idle
         const active = ordersData.orders.some(
           (o) => !["CONFIRMED", "COMPENSATED", "DEAD_LETTERED"].includes(o.status)
@@ -150,6 +155,25 @@ export default function FailureLabPage() {
     setRetrying(id);
     try {
       await fetch(`/api/dlq/${id}/retry`, { method: "POST" });
+      poll(0);
+    } finally {
+      setRetrying(null);
+    }
+  };
+
+  const resetCB = async (name?: string) => {
+    await fetch("/api/circuit-breakers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(name ? { name } : {}),
+    });
+    poll(0);
+  };
+
+  const retryAll = async () => {
+    setRetrying("all");
+    try {
+      await fetch("/api/dlq/retry-all", { method: "POST" });
       poll(0);
     } finally {
       setRetrying(null);
@@ -441,18 +465,99 @@ export default function FailureLabPage() {
         )}
       </Card>
 
+      {/* Circuit Breaker Panel */}
+      {breakers.length > 0 && (
+        <Card>
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wider">
+              Circuit Breakers
+              {breakers.some((b) => b.state !== "CLOSED") && (
+                <Badge variant="warning" className="ml-2">
+                  {breakers.filter((b) => b.state !== "CLOSED").length} tripped
+                </Badge>
+              )}
+            </h2>
+            {breakers.some((b) => b.state !== "CLOSED") && (
+              <Button variant="ghost" size="sm" onClick={() => resetCB()}>
+                <RefreshCw className="h-3 w-3" />
+                Reset All
+              </Button>
+            )}
+          </div>
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+            {breakers.map((b) => {
+              const stateColor = b.state === "CLOSED"    ? "border-green-800/50 bg-green-950/20"
+                               : b.state === "OPEN"      ? "border-red-800/50 bg-red-950/20"
+                               : "border-yellow-800/50 bg-yellow-950/20";
+              const stateText  = b.state === "CLOSED"    ? "text-green-400"
+                               : b.state === "OPEN"      ? "text-red-400"
+                               : "text-yellow-400";
+              const now = Date.now();
+              const retryIn = b.nextRetryAt ? Math.max(0, Math.ceil((b.nextRetryAt - now) / 1000)) : null;
+              return (
+                <div key={b.name} className={`rounded-lg border p-3 ${stateColor}`}>
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-mono text-zinc-300">{b.name}</span>
+                    <span className={`text-xs font-bold ${stateText}`}>{b.state}</span>
+                  </div>
+                  <div className="space-y-0.5 text-xs text-zinc-500">
+                    <div className="flex justify-between">
+                      <span>failures</span>
+                      <span className="font-mono text-zinc-300">{b.failureCount} / {b.failureThreshold}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>total calls</span>
+                      <span className="font-mono text-zinc-400">{b.totalCalls}</span>
+                    </div>
+                    {retryIn !== null && retryIn > 0 && (
+                      <div className="flex justify-between">
+                        <span>retry in</span>
+                        <span className="font-mono text-yellow-400">{retryIn}s</span>
+                      </div>
+                    )}
+                  </div>
+                  {b.state !== "CLOSED" && (
+                    <button
+                      onClick={() => resetCB(b.name)}
+                      className="mt-2 w-full rounded text-[10px] py-1 bg-zinc-800 text-zinc-400 hover:bg-zinc-700 transition-colors"
+                    >
+                      Reset
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          <p className="text-[10px] text-zinc-600 font-mono mt-3">
+            CLOSED → normal · OPEN → fast-fail after {breakers[0]?.failureThreshold ?? 3}× failures · HALF_OPEN → trial after {Math.round((breakers[0]?.timeoutMs ?? 8000) / 1000)}s
+          </p>
+        </Card>
+      )}
+
       {/* DLQ Panel */}
       <Card>
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wider">
-            Dead Letter Queue
+          <div className="flex items-center gap-2">
+            <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wider">
+              Dead Letter Queue
+            </h2>
             <Badge
               variant={dlq.filter((d) => !d.resolvedAt).length > 0 ? "danger" : "muted"}
-              className="ml-2"
             >
               {dlq.filter((d) => !d.resolvedAt).length} pending
             </Badge>
-          </h2>
+          </div>
+          {dlq.filter((d) => !d.resolvedAt).length > 1 && (
+            <Button
+              variant="outline"
+              size="sm"
+              loading={retrying === "all"}
+              onClick={retryAll}
+            >
+              <RotateCcw className="h-3 w-3" />
+              Retry All
+            </Button>
+          )}
         </div>
 
         {dlq.length === 0 ? (
